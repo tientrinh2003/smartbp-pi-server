@@ -56,11 +56,14 @@ venv.bak/
 .DS_Store
 Thumbs.db
 
-# Models (too large for git)
-models/
-*.tflite
-*.h5
-*.pb
+# Models (too large for git - use releases or external storage)
+models/*.tflite
+models/*.h5
+models/*.pb
+models/*.onnx
+*.weights
+saved_model/
+checkpoints/
 
 # Logs
 *.log

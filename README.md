@@ -39,9 +39,15 @@ pip install fastapi uvicorn opencv-python sounddevice numpy
 pip install tflite-runtime  # For Pi optimization
 ```
 
-3. Place YamNet model files in `models/` directory:
-   - `yamnet_finetuned_builtin.tflite` (preferred)
-   - `yamnet_finetuned.tflite` (fallback)
+3. Setup YamNet model files:
+```bash
+# Run model setup script
+chmod +x download_models.sh
+./download_models.sh
+
+# Or manually copy your trained models to models/ directory
+# See models/README.md for detailed instructions
+```
 
 ## Usage
 

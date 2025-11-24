@@ -46,7 +46,8 @@ from typing import List, Optional, Tuple, Dict
 
 import numpy as np
 
-from fastapi import FastAPI, UploadFile, File, Response
+from fastapi import FastAPI, UploadFile, File, Response, Body
+from pydantic import BaseModel
 
 from fastapi.responses import JSONResponse, HTMLResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -451,6 +452,8 @@ class AudioState:
 
         self.last_scores: List[Tuple[int, float]] = []
 
+        self.last_inference_at: float = 0.0  # timestamp of last successful inference
+
         self.running = False
 
         self.thread: Optional[threading.Thread] = None
@@ -586,21 +589,27 @@ def audio_loop():
 
                 with audio_state.lock:
                     if len(raw_scores) == 1:
-                        # Single output - convert to format expected by other functions
+                        # Single output (sigmoid) - convert to binary classification format
                         speech_prob = float(raw_scores[0])
-                        audio_state.last_scores = [(1, speech_prob), (0, 1.0-speech_prob)] if speech_prob > 0.5 else [(0, 1.0-speech_prob), (1, speech_prob)]
+                        if speech_prob > 0.5:
+                            # Speech detected - class 1 with high confidence
+                            audio_state.last_scores = [(1, speech_prob), (0, 1.0-speech_prob)]
+                            logger.info(f"🔄 Converted to: class 1 (speech) = {speech_prob:.3f}, class 0 = {1.0-speech_prob:.3f}")
+                        else:
+                            # No speech - class 0 with high confidence
+                            audio_state.last_scores = [(0, 1.0-speech_prob), (1, speech_prob)]
+                            logger.info(f"🔄 Converted to: class 0 (no_speech) = {1.0-speech_prob:.3f}, class 1 = {speech_prob:.3f}")
                     else:
                         audio_state.last_scores = results
+                    audio_state.last_inference_at = time.time()
 
             else:
 
-                # No audio input available - set realistic "no audio" state
-
+                # Not enough buffered audio yet; keep previous inference scores.
+                # Initialize baseline only if we have never inferred.
                 with audio_state.lock:
-
-                    audio_state.last_scores = [(0, 0.95), (1, 0.05)]  # class 0=no_speech, class 1=speech
-
-                # Default no_speech state - logging disabled to reduce spam
+                    if not audio_state.last_scores:
+                        audio_state.last_scores = [(0, 0.99), (1, 0.01)]
 
             time.sleep(0.05)
 
@@ -871,127 +880,40 @@ def api_speech_status():
 
 @app.get("/api/ai/status")
 def api_ai_status():
-    """Enhanced AI status endpoint với speech detection logic"""
+    """Get current AI speech detection status"""
+    
     with audio_state.lock:
         topk = list(audio_state.last_scores)
     
-    # Binary model: single speech probability
-    speech_status = "no_backend"
-    confidence = 0.0
-    timestamp = time.time()
+    # Check if we have valid data
+    if not topk or len(topk) == 0:
+        logger.info("🎤 API Status: no_data")
+        logger.info("📡 API Response: is_speaking=False")
+        return JSONResponse({
+            "is_speaking": False,
+            "confidence": 0.0,
+            "status": "no_data",
+            "timestamp": time.time()
+        })
     
-    if topk and len(topk) > 0:
-        # Handle binary model output: topk = [(class_idx, probability), ...]
-        top_class, top_prob = topk[0]
-        
-        # Binary threshold for speech detection
-        SPEECH_THRESHOLD = 0.5
-        
-        # If class 1 (speech) or probability > threshold, it's speaking
-        if (top_class == 1 and top_prob > SPEECH_THRESHOLD) or top_prob > SPEECH_THRESHOLD:
-            speech_status = "speaking"
-            confidence = top_prob
-        else:
-            speech_status = "not_speaking" 
-            confidence = 1.0 - top_prob if top_class == 1 else top_prob
-            
-        logger.info(f"🎤 API Status: {speech_status} (confidence: {confidence:.3f}, top_class: {top_class})")
+    # Binary model: topk = [(class_idx, probability)]
+    top_class, top_prob = topk[0]
     
-    response_data = {
-        "success": True,
-        "data": {
-            "speech_analysis": {
-                "is_speaking": speech_status == "speaking",
-                "confidence": confidence,
-                "class_name": "Speech" if speech_status == "speaking" else "Silence"
-            }
-        },
-        "backend": backend.backend_name,
-        "raw_scores": topk[:3]  # Debug info
-    }
+    # class 0 = no_speech, class 1 = speech
+    is_speaking = (top_class == 1)
+    confidence = top_prob
     
-    # Log API response for debugging
-    logger.info(f"📡 API Response: is_speaking={response_data['data']['speech_analysis']['is_speaking']}")
+    status = "speaking" if is_speaking else "quiet"
     
-    return response_data
-
-
-def api_ai_status():
-    """Enhanced AI status endpoint với speech detection logic"""
-    with audio_state.lock:
-        topk = list(audio_state.last_scores)
+    logger.info(f"🎤 API Status: {status} (confidence: {confidence:.3f}, class: {top_class})")
+    logger.info(f"📡 API Response: is_speaking={is_speaking}")
     
-    # YamNet fine-tuned model: class 0=no_speech, class 1=speech
-    speech_status = "no_backend"
-    confidence = 0.0
-    timestamp = time.time()
-    
-    if topk and len(topk) >= 2:
-        # topk = [(class_idx, probability), ...]
-        class_0_prob = next((prob for idx, prob in topk if idx == 0), 0.0)  # no_speech
-        class_1_prob = next((prob for idx, prob in topk if idx == 1), 0.0)  # speech
-        
-        # Áp dụng threshold để quyết định
-        SPEECH_THRESHOLD = 0.6  # Threshold cao hơn để tránh false positive
-        
-        if class_1_prob > SPEECH_THRESHOLD and class_1_prob > class_0_prob:
-            speech_status = "speaking"
-            confidence = class_1_prob
-        else:
-            speech_status = "not_speaking" 
-            confidence = class_0_prob
-            
-        logger.info(f"🎤 Speech Detection: {speech_status} (confidence: {confidence:.3f}, class_0: {class_0_prob:.3f}, class_1: {class_1_prob:.3f})")
-    
-    return {
-        "speech": {
-            "status": speech_status,
-            "confidence": confidence,
-            "timestamp": timestamp,
-            "color": "red" if speech_status == "speaking" else "green"
-        },
-        "backend": backend.backend_name,
-        "raw_scores": topk[:3]  # Debug info
-    }
-
-
-def api_ai_status():
-    """Enhanced AI status endpoint với speech detection logic"""
-    with audio_state.lock:
-        topk = list(audio_state.last_scores)
-    
-    # YamNet fine-tuned model: class 0=no_speech, class 1=speech
-    speech_status = "no_backend"
-    confidence = 0.0
-    timestamp = time.time()
-    
-    if topk and len(topk) >= 2:
-        # topk = [(class_idx, probability), ...]
-        class_0_prob = next((prob for idx, prob in topk if idx == 0), 0.0)  # no_speech
-        class_1_prob = next((prob for idx, prob in topk if idx == 1), 0.0)  # speech
-        
-        # Áp dụng threshold để quyết định
-        SPEECH_THRESHOLD = 0.6  # Threshold cao hơn để tránh false positive
-        
-        if class_1_prob > SPEECH_THRESHOLD and class_1_prob > class_0_prob:
-            speech_status = "speaking"
-            confidence = class_1_prob
-        else:
-            speech_status = "not_speaking" 
-            confidence = class_0_prob
-            
-        logger.info(f"🎤 Speech Detection: {speech_status} (confidence: {confidence:.3f}, class_0: {class_0_prob:.3f}, class_1: {class_1_prob:.3f})")
-    
-    return {
-        "speech": {
-            "status": speech_status,
-            "confidence": confidence,
-            "timestamp": timestamp,
-            "color": "red" if speech_status == "speaking" else "green"
-        },
-        "backend": backend.backend_name,
-        "raw_scores": topk[:3]  # Debug info
-    }
+    return JSONResponse({
+        "is_speaking": is_speaking,
+        "confidence": confidence,
+        "status": status,
+        "timestamp": time.time()
+    })
 
 
 
@@ -1035,34 +957,36 @@ def api_camera_snapshot():
 def get_current_ai_status():
     """Helper function to get current AI status for camera overlay"""
     try:
-        # Use the same logic as api_ai_status endpoint with audio_state
         with audio_state.lock:
             topk = list(audio_state.last_scores)
         
         if not topk or len(topk) == 0:
             return {
                 "speech": {
-                    "status": "no_backend",
+                    "status": "no_data",
                     "confidence": 0.0,
                     "timestamp": time.time(),
-                    "color": "green"
+                    "color": "green",
+                    "is_speaking": False
                 }
             }
         
-        # YamNet fine-tuned model: class 0=no_speech, class 1=speech
-        class_0_prob = next((prob for idx, prob in topk if idx == 0), 0.0)  # no_speech
-        class_1_prob = next((prob for idx, prob in topk if idx == 1), 0.0)  # speech
+        # Binary model: topk = [(class_idx, probability)]
+        top_class, top_prob = topk[0]
         
-        # Apply threshold to decide
-        SPEECH_THRESHOLD = 0.6
+        # class 0 = no_speech, class 1 = speech
+        is_speaking = (top_class == 1)
+        confidence = top_prob
         
-        if class_1_prob > SPEECH_THRESHOLD and class_1_prob > class_0_prob:
-            status = "speaking"
-            confidence = class_1_prob
-            color = "red"
+        if is_speaking:
+            if confidence > 0.8:
+                status = "speaking"
+                color = "red"
+            else:
+                status = "maybe_speaking"
+                color = "yellow"
         else:
-            status = "no_speech" 
-            confidence = class_0_prob
+            status = "quiet"
             color = "green"
         
         return {
@@ -1070,7 +994,8 @@ def get_current_ai_status():
                 "status": status,
                 "confidence": confidence,
                 "timestamp": time.time(),
-                "color": color
+                "color": color,
+                "is_speaking": is_speaking
             }
         }
     except Exception as e:
@@ -1110,6 +1035,63 @@ def stop_monitoring():
     except Exception as e:
         logger.error(f"Failed to stop monitoring: {e}")
         return {"success": False, "error": str(e)}
+
+
+@app.post("/api/bluetooth/scan")
+async def scan_bluetooth():
+    """Scan for nearby Bluetooth devices"""
+    try:
+        from bluetooth_scanner import scan_bluetooth_devices
+        devices = await scan_bluetooth_devices(scan_duration=8)
+        return {"success": True, "devices": devices, "count": len(devices)}
+    except Exception as e:
+        logger.error(f"Bluetooth scan error: {e}")
+        return {"success": False, "error": str(e), "devices": []}
+
+
+class MeasureRequest(BaseModel):
+    device_address: str
+
+@app.post("/api/bluetooth/measure")
+async def measure_blood_pressure(request: MeasureRequest):
+    """
+    Measure blood pressure from Bluetooth device
+    Body: { "device_address": "00:5F:BF:3A:51:BD" }
+    """
+    try:
+        device_address = request.device_address
+        
+        if not device_address:
+            return JSONResponse({
+                "success": False, 
+                "error": "Missing device_address"
+            }, status_code=400)
+        
+        logger.info(f"🩺 Bắt đầu đo huyết áp từ thiết bị: {device_address}")
+        
+        from bluetooth_bp_client import measure_once
+        result = await measure_once(device_address, timeout=120)
+        
+        if result:
+            logger.info(f"✅ API trả về kết quả: {result}")
+            return JSONResponse({
+                "success": True,
+                "data": result,
+                "message": "Đo huyết áp thành công"
+            })
+        else:
+            logger.warning("⚠️ Không nhận được dữ liệu từ thiết bị")
+            return JSONResponse({
+                "success": False, 
+                "error": "Không nhận được dữ liệu từ thiết bị. Vui lòng bật chế độ đo trên máy."
+            }, status_code=408)
+    
+    except Exception as e:
+        logger.error(f"Measurement error: {e}")
+        return JSONResponse({
+            "success": False, 
+            "error": str(e)
+        }, status_code=500)
 
 
 @app.get("/api/camera/stream")
