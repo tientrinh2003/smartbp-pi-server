@@ -6,6 +6,7 @@ import asyncio
 from bleak import BleakClient, BleakError
 from datetime import datetime
 import logging
+from sfloat import parse_measurement  # Import IEEE 11073 SFLOAT decoder
 
 logger = logging.getLogger(__name__)
 
@@ -13,44 +14,33 @@ BLOOD_PRESSURE_MEASUREMENT_UUID = "00002a35-0000-1000-8000-00805f9b34fb"
 
 def parse_blood_pressure_data(data: bytearray) -> dict:
     """
-    Phân tích dữ liệu BLE từ máy đo huyết áp
+    Phân tích dữ liệu BLE từ máy đo huyết áp theo chuẩn IEEE 11073 SFLOAT
     Returns: dict với sys, dia, map, pulse, timestamp
     """
     try:
+        # Dùng SFLOAT decoder theo chuẩn IEEE 11073 (từ thesis Chapter 4)
+        result = parse_measurement(data)
+        
+        # Parse timestamp nếu có (flags bit 1)
         flags = data[0]
-        unit_is_kpa = flags & 0x01
         has_timestamp = flags & 0x02
-        has_pulse_rate = flags & 0x04
-
-        sys_val = int.from_bytes(data[1:3], "little")
-        dia_val = int.from_bytes(data[3:5], "little")
-        map_val = int.from_bytes(data[5:7], "little")
-
-        result = {
-            "sys": sys_val,
-            "dia": dia_val,
-            "map": map_val,
-            "unit": "kPa" if unit_is_kpa else "mmHg"
-        }
-
-        idx = 7
-
-        if has_timestamp:
+        
+        if has_timestamp and len(data) >= 14:
+            idx = 7  # Timestamp starts after 3 SFLOAT values (sys, dia, map)
             year = int.from_bytes(data[idx:idx + 2], "little")
             month, day, hour, minute, second = data[idx + 2:idx + 7]
             result["timestamp"] = f"{year}-{month:02d}-{day:02d} {hour:02d}:{minute:02d}:{second:02d}"
-            idx += 7
-
-        if has_pulse_rate:
-            pulse = int.from_bytes(data[idx:idx + 2], "little")
-            result["pulse"] = pulse
-            idx += 2
-
-        logger.info(f"✅ Đã đo: SYS={result['sys']}, DIA={result['dia']}, Pulse={result.get('pulse', 'N/A')}")
+        
+        # Rename keys để tương thích với code cũ
+        result["sys"] = int(result["systolic"])
+        result["dia"] = int(result["diastolic"])
+        result["map"] = int(result["mean_ap"])
+        
+        logger.info(f"✅ Đã đo (SFLOAT): SYS={result['sys']}, DIA={result['dia']}, Pulse={result.get('pulse', 'N/A')}")
         return result
 
     except Exception as e:
-        logger.error(f"❌ Lỗi parse dữ liệu: {e}")
+        logger.error(f"❌ Lỗi parse dữ liệu SFLOAT: {e}")
         return None
 
 

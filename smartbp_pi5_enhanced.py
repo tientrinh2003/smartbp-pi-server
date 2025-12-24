@@ -1114,10 +1114,13 @@ def api_camera_stream():
             # Set camera properties for better performance
             cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
             cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
-            cap.set(cv2.CAP_PROP_FPS, 15)
+            cap.set(cv2.CAP_PROP_FPS, 20)
+            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)  # Reduce buffer to minimize lag
             
             frame_count = 0
             camera_state.set_streaming(True)
+            last_ai_check = 0
+            cached_ai_data = None
             
             while camera_state.streaming_active:
                 ret, frame = cap.read()
@@ -1125,56 +1128,44 @@ def api_camera_stream():
                     logger.warning("Failed to read frame from camera")
                     break
                 
-                # Always add AI status overlay for debugging
+                # Get AI status only every 0.5s to reduce overhead
+                current_time = time.time()
+                if current_time - last_ai_check > 0.5:
+                    try:
+                        cached_ai_data = get_current_ai_status()
+                        last_ai_check = current_time
+                    except Exception as e:
+                        logger.error(f"Error getting AI status: {e}")
+                        cached_ai_data = None
+                
+                # Add AI overlay with cached data
                 try:
-                    # Get current AI status for overlay
-                    ai_data = get_current_ai_status()
-                    logger.debug(f"AI data for overlay: {ai_data}")
-                    
-                    if ai_data and ai_data.get('speech'):
-                        speech = ai_data['speech']
+                    if cached_ai_data and cached_ai_data.get('speech'):
+                        speech = cached_ai_data['speech']
                         status = speech.get('status', 'unknown')
                         confidence = speech.get('confidence', 0.0)
-                        color = speech.get('color', 'white')
+                        is_speaking = speech.get('is_speaking', False)
                         
-                        # Convert color name to BGR
-                        color_map = {
-                            'red': (0, 0, 255),
-                            'yellow': (0, 255, 255), 
-                            'green': (0, 255, 0),
-                            'white': (255, 255, 255)
-                        }
-                        bgr_color = color_map.get(color, (255, 255, 255))
+                        # Simpler overlay for better performance
+                        if is_speaking:
+                            text = f"Dang noi ({confidence:.0%})"
+                            color = (0, 0, 255)  # Red
+                        else:
+                            text = f"Im lang ({confidence:.0%})"
+                            color = (0, 255, 0)  # Green
                         
-                        # Add text overlay with background box for better visibility
-                        text = f"Speech: {status} ({confidence:.2f})"
-                        
-                        # Get text size for background box
-                        (text_width, text_height), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 1.0, 2)
-                        
-                        # Draw background rectangle
-                        cv2.rectangle(frame, (5, 5), (text_width + 20, text_height + 20), (0, 0, 0), -1)
-                        
-                        # Draw text
-                        cv2.putText(frame, text, (10, text_height + 15), cv2.FONT_HERSHEY_SIMPLEX, 
-                                   1.0, bgr_color, 2)
-                    else:
-                        # Fallback text nếu không có AI data
-                        text = "AI: No Data"
-                        cv2.rectangle(frame, (5, 5), (150, 35), (0, 0, 0), -1)
-                        cv2.putText(frame, text, (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 
-                                   0.7, (0, 0, 255), 2)
+                        # Draw text with shadow for visibility
+                        cv2.putText(frame, text, (12, 32), cv2.FONT_HERSHEY_SIMPLEX, 
+                                   0.8, (0, 0, 0), 3)  # Shadow
+                        cv2.putText(frame, text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 
+                                   0.8, color, 2)  # Text
                         
                 except Exception as e:
-                    logger.error(f"Error adding overlay: {e}")
-                    # Emergency fallback text
-                    text = "AI: ERROR"
-                    cv2.rectangle(frame, (5, 5), (120, 35), (0, 0, 0), -1)
-                    cv2.putText(frame, text, (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 
-                               0.7, (0, 0, 255), 2)
+                    # Silently fail overlay to not interrupt stream
+                    pass
                 
-                # Encode frame as JPEG
-                ret, buffer = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
+                # Encode frame as JPEG with lower quality for speed
+                ret, buffer = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 75])
                 if not ret:
                     break
                     
@@ -1185,13 +1176,17 @@ def api_camera_stream():
                        b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
                 
                 frame_count += 1
-                time.sleep(0.066)  # ~15 FPS
+                time.sleep(0.03)  # ~30 FPS max (reduced sleep for smoother video)
                 
+        except GeneratorExit:
+            # Client disconnected - clean up immediately
+            logger.info("📷 Client disconnected from stream")
         except Exception as e:
             logger.error(f"Camera streaming error: {e}")
         finally:
-            if cap:
+            if cap is not None and cap.isOpened():
                 cap.release()
+                logger.info("📷 Camera released")
             camera_state.set_streaming(False)
             logger.info("📹 Camera streaming ended")
     

@@ -1,0 +1,5 @@
+bleak
+paho-mqtt
+websockets
+requests
+numpy

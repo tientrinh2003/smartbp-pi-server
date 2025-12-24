@@ -72,3 +72,13 @@ logs/
 # Temporary files
 *.tmp
 *.temp
+
+# Added exclusions for GitHub
+.github/
+.gitlab/
+*.key
+*.pem
+*.crt
+*.p12
+*.pfx
+secrets/
