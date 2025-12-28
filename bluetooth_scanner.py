@@ -8,7 +8,7 @@ import logging
 
 logger = logging.getLogger(__name__)
 
-async def scan_bluetooth_devices(scan_duration: int = 5):
+async def scan_bluetooth_devices(scan_duration: int = 20):
     """
     Quét thiết bị Bluetooth xung quanh
     

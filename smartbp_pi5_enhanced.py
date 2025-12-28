@@ -21,6 +21,7 @@ SmartBP Pi5 Enhanced Server (clean)
 
 
 import os
+import asyncio
 
 import io
 
@@ -469,12 +470,33 @@ class CameraState:
     def __init__(self):
         self.streaming_active = False
         self.lock = threading.Lock()
+        self.active_captures = []  # Track active VideoCapture objects
     
     def set_streaming(self, active: bool):
         with self.lock:
-            self.streaming_active = active
-            if not active:
+            if active:
+                self.streaming_active = True
+            else:
+                # Ensure all captures are released before marking as inactive
+                for cap in self.active_captures:
+                    try:
+                        if cap and cap.isOpened():
+                            cap.release()
+                            logger.info("📷 Force released camera capture")
+                    except Exception as e:
+                        logger.error(f"Error releasing camera: {e}")
+                self.active_captures.clear()
+                self.streaming_active = False
                 logger.info("📷 Camera streaming stopped")
+    
+    def register_capture(self, cap):
+        with self.lock:
+            self.active_captures.append(cap)
+    
+    def unregister_capture(self, cap):
+        with self.lock:
+            if cap in self.active_captures:
+                self.active_captures.remove(cap)
 
 camera_state = CameraState()
 
@@ -647,7 +669,12 @@ def start_audio_if_possible():
 
     if audio_state.running:
 
+        logger.info("Audio already running.")
+
         return
+
+    # Add small delay to ensure hardware is ready after previous stop
+    time.sleep(0.1)
 
     audio_state.running = True
 
@@ -663,6 +690,8 @@ def stop_audio():
 
     if not audio_state.running:
 
+        logger.info("Audio already stopped.")
+
         return
 
     audio_state.running = False
@@ -672,6 +701,9 @@ def stop_audio():
         audio_state.thread.join(timeout=2.0)
 
         audio_state.thread = None
+
+    # Add delay to ensure hardware cleanup before next start
+    time.sleep(0.15)
 
 
 
@@ -876,6 +908,110 @@ def api_speech_status():
         topk = list(audio_state.last_scores)
 
     return InferResponse(backend=backend.backend_name, topk=topk)
+
+
+# -----------------------
+# Bluetooth measurement background manager
+# -----------------------
+# Mapping: device_address -> {"task": asyncio.Task, "cancel": asyncio.Event}
+bluetooth_tasks: Dict[str, Dict] = {}
+
+
+async def _run_measure_background(device_address: str, timeout: int = 120, cancel_event: asyncio.Event = None):
+    try:
+        # import here to avoid circular / startup issues
+        from bluetooth_bp_client import measure_once
+        # propagate_exceptions=True so we can react to real errors
+        result = await measure_once(device_address, timeout=timeout, cancel_event=cancel_event, propagate_exceptions=True)
+        logger.info(f"Background measure finished for {device_address}: {result}")
+        return result
+    except asyncio.CancelledError:
+        logger.info(f"Background measure task cancelled for {device_address}")
+        raise
+    except Exception as e:
+        logger.error(f"Background measure error for {device_address}: {e}")
+        # On measurement error, cancel other bluetooth measurement tasks only
+        try:
+            cancel_all_bluetooth_tasks()
+        except Exception as stop_err:
+            logger.error(f"Error while cancelling bluetooth tasks: {stop_err}")
+    finally:
+        # cleanup
+        bluetooth_tasks.pop(device_address, None)
+
+
+def stop_all_bluetooth_measurements():
+    """Signal cancellation and cancel all running bluetooth measurement tasks."""
+    logger.info("🔴 Stopping all bluetooth measurements due to error or explicit stop request")
+    # Make a shallow copy to avoid modification during iteration
+    for addr, entry in list(bluetooth_tasks.items()):
+        try:
+            entry.get("cancel") and entry["cancel"].set()
+            task = entry.get("task")
+            if task and not task.done():
+                task.cancel()
+                logger.info(f"  - Cancelled task for {addr}")
+        except Exception as e:
+            logger.error(f"Failed to cancel task for {addr}: {e}")
+    # NOTE: do not stop audio or shutdown server here; keep audio/camera running
+
+
+def cancel_all_bluetooth_tasks():
+    """Cancel bluetooth measurement tasks but do not touch audio/camera/system state."""
+    logger.info("🟠 Cancelling all bluetooth measurement tasks (preserve audio/camera)")
+    for addr, entry in list(bluetooth_tasks.items()):
+        try:
+            entry.get("cancel") and entry["cancel"].set()
+            task = entry.get("task")
+            if task and not task.done():
+                task.cancel()
+                logger.info(f"  - Cancelled task for {addr}")
+        except Exception as e:
+            logger.error(f"Failed to cancel task for {addr}: {e}")
+
+
+@app.post("/api/bluetooth/measure/start")
+async def api_bluetooth_measure_start(body: Dict = Body(...)):
+    device_address = body.get("device_address")
+    timeout = int(body.get("timeout", 120))
+    if not device_address:
+        return JSONResponse({"error": "missing device_address"}, status_code=400)
+
+    if device_address in bluetooth_tasks:
+        return JSONResponse({"status": "already_running"}, status_code=409)
+
+    cancel_event = asyncio.Event()
+    task = asyncio.create_task(_run_measure_background(device_address, timeout=timeout, cancel_event=cancel_event))
+    bluetooth_tasks[device_address] = {"task": task, "cancel": cancel_event}
+    logger.info(f"Started background measurement for {device_address}")
+    return {"status": "started"}
+
+
+@app.post("/api/bluetooth/measure/stop")
+async def api_bluetooth_measure_stop(body: Dict = Body(...)):
+    device_address = body.get("device_address")
+    if not device_address:
+        return JSONResponse({"error": "missing device_address"}, status_code=400)
+    # Special token to stop all
+    if device_address == 'all':
+        cancel_all_bluetooth_tasks()
+        logger.info("Stop requested for all bluetooth measurements")
+        return {"status": "stopping_all"}
+
+    entry = bluetooth_tasks.get(device_address)
+    if not entry:
+        return JSONResponse({"status": "not_running"}, status_code=404)
+
+    # Signal cancellation and cancel task
+    try:
+        entry["cancel"].set()
+        entry["task"].cancel()
+        logger.info(f"Stop requested for background measurement {device_address}")
+        return {"status": "stopping"}
+    except Exception as e:
+        logger.error(f"Error stopping measurement for {device_address}: {e}")
+        return JSONResponse({"error": "failed_to_stop"}, status_code=500)
+
 
 
 @app.get("/api/ai/status")
@@ -1083,7 +1219,7 @@ async def measure_blood_pressure(request: MeasureRequest):
             logger.warning("⚠️ Không nhận được dữ liệu từ thiết bị")
             return JSONResponse({
                 "success": False, 
-                "error": "Không nhận được dữ liệu từ thiết bị. Vui lòng bật chế độ đo trên máy."
+                "error": "Không nhận được dữ liệu. Vui lòng đảm bảo đã BẤM NÚT START trên máy Omron sau khi kết nối."
             }, status_code=408)
     
     except Exception as e:
@@ -1100,6 +1236,14 @@ def api_camera_stream():
     if not HAVE_CV2:
         return JSONResponse({"error": "OpenCV not available for streaming"}, status_code=404)
     
+    # Check if camera is already streaming
+    with camera_state.lock:
+        if camera_state.streaming_active:
+            logger.warning("⚠️ Camera already streaming - rejecting duplicate request")
+            return JSONResponse({"error": "Camera already in use by another client"}, status_code=409)
+        # Set streaming_active BEFORE opening camera to prevent race condition
+        camera_state.streaming_active = True
+    
     def generate_mjpeg():
         import time
         logger.info("📹 Camera streaming started with AI overlay")
@@ -1109,7 +1253,11 @@ def api_camera_stream():
             cap = cv2.VideoCapture(CAMERA_INDEX)
             if not cap.isOpened():
                 logger.error("Cannot open camera for streaming")
+                camera_state.set_streaming(False)  # Reset flag on failure
                 return
+            
+            # Register this capture object for cleanup
+            camera_state.register_capture(cap)
             
             # Set camera properties for better performance
             cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
@@ -1118,7 +1266,7 @@ def api_camera_stream():
             cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)  # Reduce buffer to minimize lag
             
             frame_count = 0
-            camera_state.set_streaming(True)
+            # Note: streaming_active already set to True before opening camera
             last_ai_check = 0
             cached_ai_data = None
             
@@ -1184,9 +1332,11 @@ def api_camera_stream():
         except Exception as e:
             logger.error(f"Camera streaming error: {e}")
         finally:
-            if cap is not None and cap.isOpened():
-                cap.release()
-                logger.info("📷 Camera released")
+            if cap is not None:
+                camera_state.unregister_capture(cap)
+                if cap.isOpened():
+                    cap.release()
+                    logger.info("📷 Camera released")
             camera_state.set_streaming(False)
             logger.info("📹 Camera streaming ended")
     

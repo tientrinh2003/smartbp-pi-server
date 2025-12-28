@@ -6,7 +6,6 @@ import asyncio
 from bleak import BleakClient, BleakError
 from datetime import datetime
 import logging
-from sfloat import parse_measurement  # Import IEEE 11073 SFLOAT decoder
 
 logger = logging.getLogger(__name__)
 
@@ -14,37 +13,48 @@ BLOOD_PRESSURE_MEASUREMENT_UUID = "00002a35-0000-1000-8000-00805f9b34fb"
 
 def parse_blood_pressure_data(data: bytearray) -> dict:
     """
-    Phân tích dữ liệu BLE từ máy đo huyết áp theo chuẩn IEEE 11073 SFLOAT
+    Phân tích dữ liệu BLE từ máy đo huyết áp
     Returns: dict với sys, dia, map, pulse, timestamp
     """
     try:
-        # Dùng SFLOAT decoder theo chuẩn IEEE 11073 (từ thesis Chapter 4)
-        result = parse_measurement(data)
-        
-        # Parse timestamp nếu có (flags bit 1)
         flags = data[0]
+        unit_is_kpa = flags & 0x01
         has_timestamp = flags & 0x02
-        
-        if has_timestamp and len(data) >= 14:
-            idx = 7  # Timestamp starts after 3 SFLOAT values (sys, dia, map)
+        has_pulse_rate = flags & 0x04
+
+        sys_val = int.from_bytes(data[1:3], "little")
+        dia_val = int.from_bytes(data[3:5], "little")
+        map_val = int.from_bytes(data[5:7], "little")
+
+        result = {
+            "sys": sys_val,
+            "dia": dia_val,
+            "map": map_val,
+            "unit": "kPa" if unit_is_kpa else "mmHg"
+        }
+
+        idx = 7
+
+        if has_timestamp:
             year = int.from_bytes(data[idx:idx + 2], "little")
             month, day, hour, minute, second = data[idx + 2:idx + 7]
             result["timestamp"] = f"{year}-{month:02d}-{day:02d} {hour:02d}:{minute:02d}:{second:02d}"
-        
-        # Rename keys để tương thích với code cũ
-        result["sys"] = int(result["systolic"])
-        result["dia"] = int(result["diastolic"])
-        result["map"] = int(result["mean_ap"])
-        
-        logger.info(f"✅ Đã đo (SFLOAT): SYS={result['sys']}, DIA={result['dia']}, Pulse={result.get('pulse', 'N/A')}")
+            idx += 7
+
+        if has_pulse_rate:
+            pulse = int.from_bytes(data[idx:idx + 2], "little")
+            result["pulse"] = pulse
+            idx += 2
+
+        logger.info(f"✅ Đã đo: SYS={result['sys']}, DIA={result['dia']}, Pulse={result.get('pulse', 'N/A')}")
         return result
 
     except Exception as e:
-        logger.error(f"❌ Lỗi parse dữ liệu SFLOAT: {e}")
+        logger.error(f"❌ Lỗi parse dữ liệu: {e}")
         return None
 
 
-async def measure_once(device_address: str, timeout: int = 120) -> dict:
+async def measure_once(device_address: str, timeout: int = 120, cancel_event: asyncio.Event = None, propagate_exceptions: bool = False) -> dict:
     """
     Kết nối và đo huyết áp một lần
     
@@ -90,42 +100,80 @@ async def measure_once(device_address: str, timeout: int = 120) -> dict:
         logger.info(f"🔗 Đang kết nối tới {device_address}...")
         client = BleakClient(device_address, timeout=30.0)
         await client.connect()
-        
+
         if not client.is_connected:
             logger.error("❌ Không thể kết nối")
             return None
-        
+
         connection_start_time[0] = asyncio.get_event_loop().time()  # Lưu thời gian kết nối
         logger.info("✅ Đã kết nối, đang chờ dữ liệu (timeout: {}s)...".format(timeout))
+        logger.info("👉 VUI LÒNG BẤM NÚT START TRÊN MÁY OMRON BÂY GIỜ!")
         await client.start_notify(BLOOD_PRESSURE_MEASUREMENT_UUID, notification_handler)
-        
-        # Chờ nhận dữ liệu - giữ kết nối liên tục như code gốc
+
+        # Chờ nhận dữ liệu - giữ kết nối liên tục; nếu thiết bị tự ngắt trước khi có data,
+        # cố gắng kết nối lại cho đến khi timeout hoặc người dùng dừng bằng cancel_event.
         start_time = asyncio.get_event_loop().time()
-        no_data_timeout = 5  # Dừng nếu không có data mới trong 5 giây (sau khi đã có ít nhất 1 kết quả)
-        
+        no_data_timeout = 15  # Tăng lên 15 giây để user có thời gian bấm START trên máy
+        waiting_msg_shown = [False]  # Flag để chỉ log 1 lần
+
         while True:
-            # Kiểm tra kết nối còn tồn tại không
-            if not client.is_connected:
-                logger.warning("⚠️ Thiết bị tự ngắt kết nối")
+            # Allow external cancellation
+            if cancel_event and cancel_event.is_set():
+                logger.info("🛑 Đã nhận tín hiệu dừng từ bên ngoài")
                 break
-            
+
             current_time = asyncio.get_event_loop().time()
             elapsed = current_time - start_time
-            
+
+            # If disconnected before receiving data, attempt reconnection until timeout
+            if not client.is_connected:
+                if len(all_measurements) == 0:
+                    logger.warning("⚠️ Thiết bị tự ngắt kết nối trước khi gửi dữ liệu - sẽ cố gắng kết nối lại...")
+                    # Try to reconnect until overall timeout
+                    remaining = timeout - elapsed
+                    if remaining <= 0:
+                        logger.warning("⏱️ Hết thời gian chờ tổng, dừng cố gắng kết nối")
+                        break
+                    try:
+                        await asyncio.sleep(1.0)
+                        logger.info("🔄 Thử kết nối lại...")
+                        client = BleakClient(device_address, timeout=10.0)
+                        await client.connect()
+                        if client.is_connected:
+                            connection_start_time[0] = asyncio.get_event_loop().time()
+                            logger.info("✅ Kết nối lại thành công, tiếp tục chờ dữ liệu")
+                            await client.start_notify(BLOOD_PRESSURE_MEASUREMENT_UUID, notification_handler)
+                            # continue loop and wait for notifications
+                            continue
+                        else:
+                            logger.warning("❌ Không thể kết nối lại ngay, sẽ thử tiếp")
+                    except Exception as recon_err:
+                        logger.debug(f"Lỗi khi nối lại: {recon_err}")
+                        # continue and let timeout handle termination
+                else:
+                    logger.warning("⚠️ Thiết bị tự ngắt kết nối")
+                    break
+
+            # Log reminder every 5 seconds if no data received yet
+            if len(all_measurements) == 0 and int(elapsed) % 5 == 0 and int(elapsed) > 0:
+                if not waiting_msg_shown[0] or int(elapsed) % 10 == 0:
+                    logger.info(f"⏳ Chờ {int(elapsed)}s - Vui lòng bấm START trên máy Omron...")
+                    waiting_msg_shown[0] = True
+
             # Timeout tổng
             if elapsed > timeout:
                 logger.warning(f"⏱️ Timeout tổng ({timeout}s), dừng nhận dữ liệu")
                 break
-            
-            # Nếu đã nhận ít nhất 1 kết quả và không có data mới trong 5 giây → dừng
+
+            # Nếu đã nhận ít nhất 1 kết quả và không có data mới trong 15 giây → dừng
             if len(all_measurements) > 0 and last_receive_time[0] is not None:
                 time_since_last = current_time - last_receive_time[0]
                 if time_since_last > no_data_timeout:
                     logger.info(f"✅ Không còn data mới sau {no_data_timeout}s")
                     logger.info(f"   Tổng {len(all_measurements)} kết quả, thời gian: {int(elapsed)}s")
                     break
-            
-            await asyncio.sleep(1.0)  # Sleep 1s thay vì 0.5s để giảm CPU
+
+            await asyncio.sleep(1.0)  # Sleep 1s để giảm CPU
         
         # Stop notify (nếu còn kết nối)
         if client.is_connected:
@@ -146,17 +194,23 @@ async def measure_once(device_address: str, timeout: int = 120) -> dict:
             logger.info(f"")
             return latest_result
         else:
-            logger.warning("⚠️ Không nhận được dữ liệu nào")
+            logger.warning("⚠️ Không nhận được dữ liệu nào - Có thể chưa bấm START trên máy Omron")
             return None
     
-    except asyncio.TimeoutError:
+    except asyncio.TimeoutError as e:
         logger.error("⏱️ Timeout kết nối")
+        if propagate_exceptions:
+            raise
         return None
     except BleakError as e:
         logger.error(f"❌ Bluetooth error: {e}")
+        if propagate_exceptions:
+            raise
         return None
     except Exception as e:
         logger.error(f"❌ Unexpected error: {e}")
+        if propagate_exceptions:
+            raise
         return None
     finally:
         if client and client.is_connected:
