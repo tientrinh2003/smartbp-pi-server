@@ -6,6 +6,7 @@ import asyncio
 from bleak import BleakClient, BleakError
 from datetime import datetime
 import logging
+from sfloat import _sfloat_to_float
 
 logger = logging.getLogger(__name__)
 
@@ -17,14 +18,21 @@ def parse_blood_pressure_data(data: bytearray) -> dict:
     Returns: dict với sys, dia, map, pulse, timestamp
     """
     try:
+        # 🔴 PRINT HEX DATA FROM OMRON
+        hex_str = ' '.join(f'{byte:02x}' for byte in data)
+        logger.info(f"📊 HEX DATA (RAW): {hex_str}")
+        logger.info(f"📊 LENGTH: {len(data)} bytes")
+        
         flags = data[0]
         unit_is_kpa = flags & 0x01
         has_timestamp = flags & 0x02
         has_pulse_rate = flags & 0x04
 
-        sys_val = int.from_bytes(data[1:3], "little")
-        dia_val = int.from_bytes(data[3:5], "little")
-        map_val = int.from_bytes(data[5:7], "little")
+        # Decode SFLOAT values (IEEE-11073 16-bit)
+        # Bytes 1-2: Systolic, Bytes 3-4: Diastolic, Bytes 5-6: MAP
+        sys_val = _sfloat_to_float(int.from_bytes(data[1:3], "little"))
+        dia_val = _sfloat_to_float(int.from_bytes(data[3:5], "little"))
+        map_val = _sfloat_to_float(int.from_bytes(data[5:7], "little"))
 
         result = {
             "sys": sys_val,
